@@ -163,6 +163,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 		}),
 	)
 	const autoApproveTimeoutRef = useRef<NodeJS.Timeout | null>(null)
+	const [followUpAnswered, setFollowUpAnswered] = useState<Set<number>>(new Set())
 
 	const clineAskRef = useRef(clineAsk)
 	useEffect(() => {
@@ -415,6 +416,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	useEffect(() => {
 		setExpandedRows({})
 		everVisibleMessagesTsRef.current.clear() // Clear for new task
+		setFollowUpAnswered(new Set()) // Clear follow-up answered state for new task
 	}, [task?.ts])
 
 	useEffect(() => {
@@ -487,6 +489,12 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 	}, [modifiedMessages, clineAsk, enableButtons, primaryButtonText])
 
 	const handleChatReset = useCallback(() => {
+		// Clear any pending auto-approval timeout to prevent race conditions
+		if (autoApproveTimeoutRef.current) {
+			clearTimeout(autoApproveTimeoutRef.current)
+			autoApproveTimeoutRef.current = null
+		}
+
 		// Only reset message-specific state, preserving mode.
 		setInputValue("")
 		setSendingDisabled(true)
@@ -507,6 +515,21 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				if (messagesRef.current.length === 0) {
 					vscode.postMessage({ type: "newTask", text, images })
 				} else if (clineAskRef.current) {
+					// Clear auto-approval timeout when user sends a message for follow-up questions
+					// This ensures the countdown timer is properly dismounted when users submit custom responses
+					if (clineAskRef.current === "followup") {
+						if (autoApproveTimeoutRef.current) {
+							clearTimeout(autoApproveTimeoutRef.current)
+							autoApproveTimeoutRef.current = null
+						}
+
+						// Mark the current follow-up question as answered
+						const lastFollowUpMessage = messagesRef.current.findLast((msg) => msg.ask === "followup")
+						if (lastFollowUpMessage) {
+							setFollowUpAnswered((prev) => new Set(prev).add(lastFollowUpMessage.ts))
+						}
+					}
+
 					// Use clineAskRef.current
 					switch (
 						clineAskRef.current // Use clineAskRef.current
@@ -1214,6 +1237,14 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 
 	const handleSuggestionClickInRow = useCallback(
 		(suggestion: SuggestionItem, event?: React.MouseEvent) => {
+			// Mark the current follow-up question as answered when a suggestion is clicked
+			if (clineAsk === "followup" && !event?.shiftKey) {
+				const lastFollowUpMessage = messagesRef.current.findLast((msg) => msg.ask === "followup")
+				if (lastFollowUpMessage) {
+					setFollowUpAnswered((prev) => new Set(prev).add(lastFollowUpMessage.ts))
+				}
+			}
+
 			// Check if we need to switch modes
 			if (suggestion.mode) {
 				// Only switch modes if it's a manual click (event exists) or auto-approval is allowed
@@ -1233,7 +1264,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 				handleSendMessage(suggestion.answer, [])
 			}
 		},
-		[handleSendMessage, setInputValue, switchToMode, alwaysAllowModeSwitch],
+		[handleSendMessage, setInputValue, switchToMode, alwaysAllowModeSwitch, clineAsk],
 	)
 
 	const handleBatchFileResponse = useCallback((response: { [key: string]: boolean }) => {
@@ -1286,6 +1317,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 					onSuggestionClick={handleSuggestionClickInRow} // This was already stabilized
 					onBatchFileResponse={handleBatchFileResponse}
 					onFollowUpUnmount={handleFollowUpUnmount}
+					isFollowUpAnswered={followUpAnswered.has(messageOrGroup.ts)}
 				/>
 			)
 		},
@@ -1299,6 +1331,7 @@ const ChatViewComponent: React.ForwardRefRenderFunction<ChatViewRef, ChatViewPro
 			handleSuggestionClickInRow,
 			handleBatchFileResponse,
 			handleFollowUpUnmount,
+			followUpAnswered,
 		],
 	)
 
