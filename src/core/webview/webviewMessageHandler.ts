@@ -5,9 +5,16 @@ import pWaitFor from "p-wait-for"
 import * as vscode from "vscode"
 import * as yaml from "yaml"
 
-import { type Language, type ProviderSettings, type GlobalState, TelemetryEventName } from "@roo-code/types"
+import {
+	type Language,
+	type ProviderSettings,
+	type GlobalState,
+	type ClineMessage,
+	TelemetryEventName,
+} from "@roo-code/types"
 import { CloudService } from "@roo-code/cloud"
 import { TelemetryService } from "@roo-code/telemetry"
+import { type ApiMessage } from "../task-persistence/apiMessages"
 
 import { ClineProvider } from "./ClineProvider"
 import { changeLanguage, t } from "../../i18n"
@@ -56,6 +63,181 @@ export const webviewMessageHandler = async (
 		await provider.contextProxy.setValue(key, value)
 
 	/**
+	 * Shared utility to find message indices based on timestamp
+	 */
+	const findMessageIndices = (messageTs: number, currentCline: any) => {
+		const timeCutoff = messageTs - 1000 // 1 second buffer before the message
+		const messageIndex = currentCline.clineMessages.findIndex((msg: ClineMessage) => msg.ts && msg.ts >= timeCutoff)
+		const apiConversationHistoryIndex = currentCline.apiConversationHistory.findIndex(
+			(msg: ApiMessage) => msg.ts && msg.ts >= timeCutoff,
+		)
+		return { messageIndex, apiConversationHistoryIndex }
+	}
+
+	/**
+	 * Removes just the target message, preserving messages after the next user message
+	 */
+	const removeMessagesJustThis = async (
+		currentCline: any,
+		messageIndex: number,
+		apiConversationHistoryIndex: number,
+	) => {
+		// Find the next user message first
+		const nextUserMessage = currentCline.clineMessages
+			.slice(messageIndex + 1)
+			.find((msg: ClineMessage) => msg.type === "say" && msg.say === "user_feedback")
+
+		// Handle UI messages
+		if (nextUserMessage) {
+			// Find absolute index of next user message
+			const nextUserMessageIndex = currentCline.clineMessages.findIndex(
+				(msg: ClineMessage) => msg === nextUserMessage,
+			)
+
+			// Keep messages before current message and after next user message
+			await currentCline.overwriteClineMessages([
+				...currentCline.clineMessages.slice(0, messageIndex),
+				...currentCline.clineMessages.slice(nextUserMessageIndex),
+			])
+		} else {
+			// If no next user message, keep only messages before current message
+			await currentCline.overwriteClineMessages(currentCline.clineMessages.slice(0, messageIndex))
+		}
+
+		// Handle API messages
+		if (apiConversationHistoryIndex !== -1) {
+			if (nextUserMessage && nextUserMessage.ts) {
+				// Keep messages before current API message and after next user message
+				await currentCline.overwriteApiConversationHistory([
+					...currentCline.apiConversationHistory.slice(0, apiConversationHistoryIndex),
+					...currentCline.apiConversationHistory.filter(
+						(msg: ApiMessage) => msg.ts && msg.ts >= nextUserMessage.ts,
+					),
+				])
+			} else {
+				// If no next user message, keep only messages before current API message
+				await currentCline.overwriteApiConversationHistory(
+					currentCline.apiConversationHistory.slice(0, apiConversationHistoryIndex),
+				)
+			}
+		}
+	}
+
+	/**
+	 * Removes the target message and all subsequent messages
+	 */
+	const removeMessagesThisAndSubsequent = async (
+		currentCline: any,
+		messageIndex: number,
+		apiConversationHistoryIndex: number,
+	) => {
+		// Delete this message and all that follow
+		await currentCline.overwriteClineMessages(currentCline.clineMessages.slice(0, messageIndex))
+
+		if (apiConversationHistoryIndex !== -1) {
+			await currentCline.overwriteApiConversationHistory(
+				currentCline.apiConversationHistory.slice(0, apiConversationHistoryIndex),
+			)
+		}
+	}
+
+	/**
+	 * Handles message deletion operations with user confirmation
+	 */
+	const handleDeleteOperation = async (messageTs: number): Promise<void> => {
+		const options = [
+			t("common:confirmation.delete_just_this_message"),
+			t("common:confirmation.delete_this_and_subsequent"),
+		]
+
+		const answer = await vscode.window.showInformationMessage(
+			t("common:confirmation.delete_message"),
+			{ modal: true },
+			...options,
+		)
+
+		// Only proceed if user selected one of the options and we have a current cline
+		if (answer && options.includes(answer) && provider.getCurrentCline()) {
+			const currentCline = provider.getCurrentCline()!
+			const { messageIndex, apiConversationHistoryIndex } = findMessageIndices(messageTs, currentCline)
+
+			if (messageIndex !== -1) {
+				try {
+					const { historyItem } = await provider.getTaskWithId(currentCline.taskId)
+
+					// Check which option the user selected
+					if (answer === options[0]) {
+						// Delete just this message
+						await removeMessagesJustThis(currentCline, messageIndex, apiConversationHistoryIndex)
+					} else if (answer === options[1]) {
+						// Delete this message and all subsequent
+						await removeMessagesThisAndSubsequent(currentCline, messageIndex, apiConversationHistoryIndex)
+					}
+
+					// Initialize with history item after deletion
+					await provider.initClineWithHistoryItem(historyItem)
+				} catch (error) {
+					console.error("Error in delete message:", error)
+					vscode.window.showErrorMessage(
+						`Error deleting message: ${error instanceof Error ? error.message : String(error)}`,
+					)
+				}
+			}
+		}
+	}
+
+	/**
+	 * Handles message editing operations with user confirmation
+	 */
+	const handleEditOperation = async (messageTs: number, editedContent: string): Promise<void> => {
+		const options = [
+			t("common:confirmation.edit_this_and_delete_subsequent"),
+			t("common:confirmation.edit_just_this_message"),
+		]
+
+		const answer = await vscode.window.showInformationMessage(
+			t("common:confirmation.edit_message"),
+			{ modal: true },
+			...options,
+		)
+
+		// Only proceed if user selected one of the options and we have a current cline
+		if (answer && options.includes(answer) && provider.getCurrentCline()) {
+			const currentCline = provider.getCurrentCline()!
+			const { messageIndex, apiConversationHistoryIndex } = findMessageIndices(messageTs, currentCline)
+
+			if (messageIndex !== -1) {
+				try {
+					// Check which option the user selected
+					if (answer === options[0]) {
+						// Edit this message and delete subsequent
+						await removeMessagesThisAndSubsequent(currentCline, messageIndex, apiConversationHistoryIndex)
+					} else if (answer === options[1]) {
+						// Edit just this message
+						await removeMessagesJustThis(currentCline, messageIndex, apiConversationHistoryIndex)
+					}
+
+					// Process the edited message as a regular user message
+					// This will add it to the conversation and trigger an AI response
+					webviewMessageHandler(provider, {
+						type: "askResponse",
+						askResponse: "messageResponse",
+						text: editedContent,
+					})
+
+					// Don't initialize with history item for edit operations
+					// The webviewMessageHandler will handle the conversation state
+				} catch (error) {
+					console.error("Error in edit message:", error)
+					vscode.window.showErrorMessage(
+						`Error editing message: ${error instanceof Error ? error.message : String(error)}`,
+					)
+				}
+			}
+		}
+	}
+
+	/**
 	 * Handles message modification operations (delete or edit) with confirmation dialog
 	 * @param messageTs Timestamp of the message to operate on
 	 * @param operation Type of operation ('delete' or 'edit')
@@ -67,125 +249,10 @@ export const webviewMessageHandler = async (
 		operation: "delete" | "edit",
 		editedContent?: string,
 	): Promise<void> => {
-		// Different visual order of options based on operation type
-		const options =
-			operation === "edit"
-				? [
-						t("common:confirmation.edit_this_and_delete_subsequent"),
-						t("common:confirmation.edit_just_this_message"),
-					]
-				: [
-						t("common:confirmation.delete_just_this_message"),
-						t("common:confirmation.delete_this_and_subsequent"),
-					]
-
-		const answer = await vscode.window.showInformationMessage(
-			operation === "edit" ? t("common:confirmation.edit_message") : t("common:confirmation.delete_message"),
-			{ modal: true },
-			...options,
-		)
-
-		// Only proceed if user selected one of the options and we have a current cline
-		if (answer && options.includes(answer) && provider.getCurrentCline()) {
-			const timeCutoff = messageTs - 1000 // 1 second buffer before the message
-			const currentCline = provider.getCurrentCline()!
-
-			const messageIndex = currentCline.clineMessages.findIndex((msg) => msg.ts && msg.ts >= timeCutoff)
-
-			const apiConversationHistoryIndex = currentCline.apiConversationHistory.findIndex(
-				(msg) => msg.ts && msg.ts >= timeCutoff,
-			)
-
-			if (messageIndex !== -1) {
-				try {
-					const { historyItem } = await provider.getTaskWithId(currentCline.taskId)
-
-					// Check if user selected the "modify just this message" option
-					// For delete: options[0], for edit: options[1]
-					if (
-						(operation === "delete" && answer === options[0]) ||
-						(operation === "edit" && answer === options[1])
-					) {
-						// Find the next user message first
-						const nextUserMessage = currentCline.clineMessages
-							.slice(messageIndex + 1)
-							.find((msg) => msg.type === "say" && msg.say === "user_feedback")
-
-						// Handle UI messages
-						if (nextUserMessage) {
-							// Find absolute index of next user message
-							const nextUserMessageIndex = currentCline.clineMessages.findIndex(
-								(msg) => msg === nextUserMessage,
-							)
-
-							// Keep messages before current message and after next user message
-							await currentCline.overwriteClineMessages([
-								...currentCline.clineMessages.slice(0, messageIndex),
-								...currentCline.clineMessages.slice(nextUserMessageIndex),
-							])
-						} else {
-							// If no next user message, keep only messages before current message
-							await currentCline.overwriteClineMessages(currentCline.clineMessages.slice(0, messageIndex))
-						}
-
-						// Handle API messages
-						if (apiConversationHistoryIndex !== -1) {
-							if (nextUserMessage && nextUserMessage.ts) {
-								// Keep messages before current API message and after next user message
-								await currentCline.overwriteApiConversationHistory([
-									...currentCline.apiConversationHistory.slice(0, apiConversationHistoryIndex),
-									...currentCline.apiConversationHistory.filter(
-										(msg) => msg.ts && msg.ts >= nextUserMessage.ts,
-									),
-								])
-							} else {
-								// If no next user message, keep only messages before current API message
-								await currentCline.overwriteApiConversationHistory(
-									currentCline.apiConversationHistory.slice(0, apiConversationHistoryIndex),
-								)
-							}
-						}
-					} else if (
-						// Check if user selected the "modify this and subsequent" option
-						// For delete: options[1], for edit: options[0]
-						(operation === "delete" && answer === options[1]) ||
-						(operation === "edit" && answer === options[0])
-					) {
-						// Delete this message and all that follow
-						await currentCline.overwriteClineMessages(currentCline.clineMessages.slice(0, messageIndex))
-
-						if (apiConversationHistoryIndex !== -1) {
-							await currentCline.overwriteApiConversationHistory(
-								currentCline.apiConversationHistory.slice(0, apiConversationHistoryIndex),
-							)
-						}
-					}
-
-					// Initialize with history item first for delete operations
-					if (operation === "delete") {
-						await provider.initClineWithHistoryItem(historyItem)
-					}
-
-					// For edit operations, process the edited message
-					if (operation === "edit" && editedContent) {
-						// Process the edited message as a regular user message
-						// This will add it to the conversation and trigger an AI response
-						webviewMessageHandler(provider, {
-							type: "askResponse",
-							askResponse: "messageResponse",
-							text: editedContent,
-						})
-
-						// Don't initialize with history item for edit operations
-						// The webviewMessageHandler will handle the conversation state
-					}
-				} catch (error) {
-					console.error(`Error in ${operation} message:`, error)
-					vscode.window.showErrorMessage(
-						`Error ${operation === "edit" ? "editing" : "deleting"} message: ${error instanceof Error ? error.message : String(error)}`,
-					)
-				}
-			}
+		if (operation === "delete") {
+			await handleDeleteOperation(messageTs)
+		} else if (operation === "edit" && editedContent) {
+			await handleEditOperation(messageTs, editedContent)
 		}
 	}
 
