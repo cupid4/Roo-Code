@@ -137,7 +137,11 @@ export function getContextMenuOptions(
 					type: ContextMenuOptionType.Mode,
 					value: result.item.original.slug,
 					label: result.item.original.name,
-					description: (result.item.original.whenToUse || result.item.original.roleDefinition).split("\n")[0],
+					description: (
+						result.item.original.description ||
+						result.item.original.whenToUse ||
+						result.item.original.roleDefinition
+					).split("\n")[0],
 				}))
 			: modes.map((mode) => ({
 					type: ContextMenuOptionType.Mode,
